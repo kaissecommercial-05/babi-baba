@@ -8,18 +8,64 @@ import {
 import {
   doc,
   setDoc,
+  getDoc,
   getDocs,
-  collection
+  updateDoc,
+  collection,
+  deleteDoc,
+  query,
+  where,
+  orderBy,
+  limit,
+  runTransaction
 } from 'firebase/firestore';
 
 import { auth, googleProvider, db } from './firebase';
 import './App.css';
 
+// Petit message flottant (remplace notify(), ne bloque pas l'écran)
+function notify(message) {
+  const toast = document.createElement('div');
+  toast.textContent = message;
+
+  Object.assign(toast.style, {
+    position: 'fixed',
+    left: '50%',
+    bottom: '90px',
+    transform: 'translateX(-50%)',
+    background: '#111',
+    color: '#fff',
+    padding: '12px 18px',
+    borderRadius: '14px',
+    fontSize: '14px',
+    lineHeight: '1.4',
+    zIndex: '99999',
+    maxWidth: '90vw',
+    textAlign: 'center',
+    boxShadow: '0 8px 30px rgba(0,0,0,0.25)'
+  });
+
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3500);
+}
+
+const CART_STORAGE_KEY = 'babibaba-cart';
+
+function loadSavedCart() {
+  try {
+    const saved = localStorage.getItem(CART_STORAGE_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function App() {
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
 
-  const [cart, setCart] = useState([]);
+  const [cart, setCart] = useState(loadSavedCart);
   const [currentPage, setCurrentPage] = useState('home');
 
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -53,9 +99,21 @@ function App() {
   // COMMANDES VENDEUR / VENTES
   // =====================================================
 
-  const [sellerOrders] = useState([]);
+  const [sellerOrders, setSellerOrders] = useState([]);
 
-  const [sellerSales] = useState([]);
+  // Une vente = une commande livrée
+  const sellerSales = sellerOrders.filter(
+    (order) => order.status === 'livree'
+  );
+
+  // Commandes passées par le client connecté
+  const [orders, setOrders] = useState([]);
+
+  const [paymentMethod, setPaymentMethod] =
+    useState('orange');
+
+  const [placingOrder, setPlacingOrder] =
+    useState(false);
 
   // =====================================================
   // INFORMATIONS COMMANDE CLIENT
@@ -129,11 +187,27 @@ function App() {
     return () => unsubscribe();
   }, []);
 
+  // Sauvegarde du panier dans le navigateur
   useEffect(() => {
-  const loadProducts = async () => {
+    try {
+      localStorage.setItem(
+        CART_STORAGE_KEY,
+        JSON.stringify(cart)
+      );
+    } catch {
+      // stockage indisponible : on ignore
+    }
+  }, [cart]);
+
+  // Chargement des 60 produits les plus récents
+  const fetchProducts = async () => {
     try {
       const productsSnapshot = await getDocs(
-        collection(db, 'products')
+        query(
+          collection(db, 'products'),
+          orderBy('createdAt', 'desc'),
+          limit(60)
+        )
       );
 
       const products = productsSnapshot.docs.map(
@@ -152,49 +226,107 @@ function App() {
     }
   };
 
-  loadProducts();
-}, []);
-
-useEffect(() => {
-  const loadShop = async () => {
-    if (!user) return;
-
+  // Chargement des commandes (achats + ventes)
+  const loadOrders = async (currentUser) => {
     try {
-      const shopSnapshot = await getDocs(
-        collection(db, 'shops')
+      const byDateDesc = (list) =>
+        list.sort((a, b) =>
+          String(b.createdAt || '').localeCompare(
+            String(a.createdAt || '')
+          )
+        );
+
+      const [mineSnapshot, receivedSnapshot] =
+        await Promise.all([
+          getDocs(
+            query(
+              collection(db, 'orders'),
+              where('buyerId', '==', currentUser.uid)
+            )
+          ),
+          getDocs(
+            query(
+              collection(db, 'orders'),
+              where(
+                'sellerIds',
+                'array-contains',
+                currentUser.uid
+              )
+            )
+          )
+        ]);
+
+      setOrders(
+        byDateDesc(
+          mineSnapshot.docs.map((orderDoc) => ({
+            id: orderDoc.id,
+            ...orderDoc.data()
+          }))
+        )
       );
 
-      const shops = shopSnapshot.docs.map(
-        (shopDoc) => ({
-          id: shopDoc.id,
-          ...shopDoc.data()
-        })
+      setSellerOrders(
+        byDateDesc(
+          receivedSnapshot.docs.map((orderDoc) => ({
+            id: orderDoc.id,
+            ...orderDoc.data()
+          }))
+        )
       );
-
-      const myShop = shops.find(
-        (shop) => shop.ownerId === user.uid
-      );
-
-      if (myShop) {
-        setSellerInfo({
-          shopName: myShop.shopName || '',
-          description: myShop.description || '',
-          location: myShop.location || '',
-          phone: myShop.phone || ''
-        });
-
-        setSellerCreated(true);
-      }
     } catch (error) {
       console.error(
-        'Erreur lors du chargement de la boutique :',
+        'Erreur lors du chargement des commandes :',
         error
       );
     }
   };
 
-  loadShop();
-}, [user]);
+  useEffect(() => {
+    fetchProducts();
+  }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setOrders([]);
+      setSellerOrders([]);
+      return;
+    }
+
+    loadOrders(user);
+  }, [user]);
+
+  useEffect(() => {
+    const loadShop = async () => {
+      if (!user) return;
+
+      try {
+        // On lit uniquement SA boutique (id = uid)
+        const shopSnapshot = await getDoc(
+          doc(db, 'shops', user.uid)
+        );
+
+        if (shopSnapshot.exists()) {
+          const myShop = shopSnapshot.data();
+
+          setSellerInfo({
+            shopName: myShop.shopName || '',
+            description: myShop.description || '',
+            location: myShop.location || '',
+            phone: myShop.phone || ''
+          });
+
+          setSellerCreated(true);
+        }
+      } catch (error) {
+        console.error(
+          'Erreur lors du chargement de la boutique :',
+          error
+        );
+      }
+    };
+
+    loadShop();
+  }, [user]);
 
   const handleGoogleLogin = async () => {
     try {
@@ -212,7 +344,7 @@ useEffect(() => {
         return;
       }
 
-      alert(
+      notify(
         'La connexion avec Google a échoué. Veuillez réessayer.'
       );
     }
@@ -267,14 +399,14 @@ useEffect(() => {
     !sellerInfo.location ||
     !sellerInfo.phone
   ) {
-    alert(
+    notify(
       'Veuillez renseigner le nom de la boutique, la localisation et le téléphone.'
     );
     return;
   }
 
   if (!user) {
-    alert(
+    notify(
       'Vous devez être connecté pour créer une boutique.'
     );
     return;
@@ -298,14 +430,14 @@ useEffect(() => {
     setSellerCreated(true);
     setCurrentPage('seller-dashboard');
 
-    alert('Votre boutique a été créée avec succès !');
+    notify('Votre boutique a été créée avec succès !');
   } catch (error) {
     console.error(
       'Erreur lors de la création de la boutique :',
       error
     );
 
-    alert(
+    notify(
       'Impossible de créer la boutique pour le moment. Veuillez réessayer.'
     );
   }
@@ -323,27 +455,84 @@ useEffect(() => {
     }));
   };
 
-  const handleProductImageChange = (event) => {
-    const file = event.target.files?.[0];
+  const handleProductImageChange = async (event) => {
+  const file = event.target.files?.[0];
 
-    if (!file) return;
+  if (!file) return;
 
-    if (!file.type.startsWith('image/')) {
-      alert('Veuillez sélectionner une image.');
-      return;
+  if (!file.type.startsWith('image/')) {
+    notify('Veuillez sélectionner une image.');
+    return;
+  }
+
+  try {
+    const authResponse = await fetch(
+  '/.netlify/functions/imagekit-auth'
+);
+
+    const authData = await authResponse.json();
+
+    if (!authResponse.ok) {
+      throw new Error(
+        authData.error || 'Erreur d’authentification ImageKit'
+      );
     }
 
-    const reader = new FileReader();
+    const formData = new FormData();
 
-    reader.onload = () => {
-      setProductForm((currentProduct) => ({
-        ...currentProduct,
-        image: reader.result
-      }));
-    };
+    formData.append('file', file);
+    formData.append('fileName', file.name);
+    formData.append('publicKey', 'public_Sqz0+cgZvi0D842i2Lb1MlHVTBw=');
+    formData.append('token', authData.token);
+    formData.append('expire', authData.expire);
+    formData.append('signature', authData.signature);
 
-    reader.readAsDataURL(file);
-  };
+    const uploadResponse = await fetch(
+  'https://upload.imagekit.io/api/v1/files/upload',
+  {
+    method: 'POST',
+    body: formData
+  }
+);
+
+const uploadText = await uploadResponse.text();
+
+console.log('Réponse ImageKit :', uploadText);
+
+let uploadData;
+
+try {
+  uploadData = JSON.parse(uploadText);
+} catch (error) {
+  throw new Error(
+    `ImageKit a renvoyé une réponse inattendue : ${uploadText.slice(0, 200)}`
+  );
+}
+
+    if (!uploadResponse.ok) {
+      throw new Error(
+        uploadData.message || 'Erreur lors de l’envoi de l’image'
+      );
+    }
+
+    setProductForm((currentProduct) => ({
+      ...currentProduct,
+      image: uploadData.url
+    }));
+
+    notify('Image envoyée avec succès !');
+  } catch (error) {
+    console.error(
+      'Erreur lors de l’envoi de l’image :',
+      error
+    );
+
+    notify(
+      'Impossible d’envoyer l’image pour le moment.'
+    );
+  }
+};
+
 
   const handlePublishProduct = async (event) => {
   event.preventDefault();
@@ -355,14 +544,14 @@ useEffect(() => {
     !productForm.category ||
     !productForm.quantity
   ) {
-    alert(
+    notify(
       'Veuillez ajouter une photo et renseigner toutes les informations obligatoires.'
     );
     return;
   }
 
   if (!user) {
-    alert(
+    notify(
       'Vous devez être connecté pour publier un produit.'
     );
     return;
@@ -378,7 +567,8 @@ useEffect(() => {
     image: productForm.image,
     shop: sellerInfo.shopName,
     location: sellerInfo.location,
-    sellerPhone: sellerInfo.phone
+    sellerPhone: sellerInfo.phone,
+    sellerId: user.uid
   };
 
   try {
@@ -393,6 +583,7 @@ useEffect(() => {
     shop: newProduct.shop,
     location: newProduct.location,
     sellerPhone: newProduct.sellerPhone,
+    image: newProduct.image,
     sellerId: user.uid,
     createdAt: new Date().toISOString()
   }
@@ -414,23 +605,39 @@ useEffect(() => {
 
     setCurrentPage('seller-products');
 
-    alert('Produit publié avec succès !');
+    notify('Produit publié avec succès !');
   } catch (error) {
     console.error(
       'Erreur lors de la publication du produit :',
       error
     );
 
-    alert(
+    notify(
       'Impossible de publier le produit pour le moment.'
     );
   }
 }
 
+  // Combien d'exemplaires de ce produit sont déjà au panier
+  const countInCart = (product) =>
+    product.id
+      ? cart.filter((item) => item.id === product.id)
+          .length
+      : 0;
+
   const addSellerProductToCart = (product) => {
     if (product.quantity <= 0) {
-      alert(
+      notify(
         'Cet article est actuellement en rupture de stock.'
+      );
+      return;
+    }
+
+    if (countInCart(product) >= product.quantity) {
+      notify(
+        `Stock maximum atteint pour ${product.name} (${product.quantity} disponible${
+          product.quantity > 1 ? 's' : ''
+        }).`
       );
       return;
     }
@@ -440,9 +647,63 @@ useEffect(() => {
       product
     ]);
 
-    alert(
+    notify(
       `${product.name} a été ajouté au panier.`
     );
+  };
+
+  // =====================================================
+  // PRODUITS DU VENDEUR CONNECTÉ
+  // =====================================================
+
+  const mySellerProducts = sellerProducts.filter(
+    (product) => product.sellerId === user?.uid
+  );
+
+  const handleDeleteProduct = async (product) => {
+    if (!user) {
+      notify(
+        'Vous devez être connecté pour supprimer un produit.'
+      );
+      return;
+    }
+
+    if (product.sellerId !== user.uid) {
+      notify(
+        'Vous ne pouvez supprimer que vos propres produits.'
+      );
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Voulez-vous vraiment supprimer "${product.name}" ?`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      await deleteDoc(
+        doc(db, 'products', product.id)
+      );
+
+      setSellerProducts((currentProducts) =>
+        currentProducts.filter(
+          (currentProduct) =>
+            currentProduct.id !== product.id
+        )
+      );
+
+      notify('Produit supprimé avec succès.');
+    } catch (error) {
+      console.error(
+        'Erreur lors de la suppression du produit :',
+        error
+      );
+
+      notify(
+        'Impossible de supprimer le produit pour le moment.'
+      );
+    }
   };
 
   // =====================================================
@@ -520,7 +781,7 @@ useEffect(() => {
         error
       );
 
-      alert(
+      notify(
         'Impossible de vous déconnecter pour le moment.'
       );
     }
@@ -531,6 +792,15 @@ useEffect(() => {
   // =====================================================
 
   const addToCart = (product) => {
+    if (
+      product.id &&
+      product.quantity !== undefined &&
+      countInCart(product) >= product.quantity
+    ) {
+      notify('Stock maximum atteint pour ce produit.');
+      return;
+    }
+
     setCart((currentCart) => [
       ...currentCart,
       product
@@ -608,6 +878,380 @@ useEffect(() => {
   };
 
   // =====================================================
+  // COMMANDES (enregistrement + baisse du stock)
+  // =====================================================
+
+  const paymentLabels = {
+    orange: 'Orange Money',
+    mtn: 'MTN Mobile Money',
+    wave: 'Wave'
+  };
+
+  const orderStatusLabels = {
+    nouvelle: '🆕 Nouvelle',
+    en_livraison: '🚚 En livraison',
+    livree: '✅ Livrée'
+  };
+
+  const handlePlaceOrder = async () => {
+    if (placingOrder) return;
+
+    if (!user) {
+      notify('Vous devez être connecté pour commander.');
+      return;
+    }
+
+    if (cart.length === 0) {
+      notify('Votre panier est vide.');
+      return;
+    }
+
+    setPlacingOrder(true);
+
+    try {
+      // Regrouper les articles identiques
+      const grouped = {};
+
+      cart.forEach((item) => {
+        const key = item.id || `demo:${item.name}`;
+
+        if (grouped[key]) {
+          grouped[key].qty += 1;
+        } else {
+          grouped[key] = { item, qty: 1 };
+        }
+      });
+
+      const entries = Object.values(grouped);
+      const stockEntries = entries.filter(
+        (entry) => entry.item.id
+      );
+
+      const orderRef = doc(collection(db, 'orders'));
+
+      await runTransaction(db, async (transaction) => {
+        // 1) Lire les produits (prix et stock réels)
+        const snapshots = await Promise.all(
+          stockEntries.map((entry) =>
+            transaction.get(
+              doc(db, 'products', entry.item.id)
+            )
+          )
+        );
+
+        const realProducts = {};
+
+        snapshots.forEach((snapshot, index) => {
+          const entry = stockEntries[index];
+
+          if (!snapshot.exists()) {
+            throw new Error(
+              `« ${entry.item.name} » n'est plus disponible.`
+            );
+          }
+
+          const data = snapshot.data();
+          const stock = Number(data.quantity || 0);
+
+          if (stock < entry.qty) {
+            throw new Error(
+              `Stock insuffisant pour « ${entry.item.name} » (${stock} restant).`
+            );
+          }
+
+          realProducts[entry.item.id] = {
+            ref: snapshot.ref,
+            data,
+            stock
+          };
+        });
+
+        // 2) Construire les lignes de commande
+        const items = entries.map((entry) => {
+          const real = entry.item.id
+            ? realProducts[entry.item.id].data
+            : entry.item;
+
+          return {
+            productId: entry.item.id || null,
+            name: real.name,
+            price: Number(real.price || 0),
+            qty: entry.qty,
+            shop: real.shop || '',
+            sellerId: real.sellerId || null,
+            image: real.image || ''
+          };
+        });
+
+        const itemsTotal = items.reduce(
+          (total, item) =>
+            total + item.price * item.qty,
+          0
+        );
+
+        const sellerIds = [
+          ...new Set(
+            items
+              .map((item) => item.sellerId)
+              .filter(Boolean)
+          )
+        ];
+
+        // 3) Baisser le stock
+        stockEntries.forEach((entry) => {
+          const real = realProducts[entry.item.id];
+
+          transaction.update(real.ref, {
+            quantity: real.stock - entry.qty
+          });
+        });
+
+        // 4) Enregistrer la commande
+        transaction.set(orderRef, {
+          buyerId: user.uid,
+          buyerName: orderInfo.name,
+          buyerEmail: user.email || '',
+          buyerPhone: orderInfo.phone,
+          address: orderInfo.address,
+          city: orderInfo.city,
+          deliveryZone: orderInfo.deliveryZone,
+          delivery: orderInfo.delivery,
+          driverChoice: orderInfo.driverChoice,
+          driverName: selectedDriver
+            ? selectedDriver.name
+            : '',
+          items,
+          sellerIds,
+          itemsTotal,
+          deliveryFee,
+          total: itemsTotal + deliveryFee,
+          paymentMethod,
+          paymentStatus: 'en_attente',
+          status: 'nouvelle',
+          createdAt: new Date().toISOString()
+        });
+      });
+
+      setCart([]);
+      await Promise.all([
+        fetchProducts(),
+        loadOrders(user)
+      ]);
+      setCurrentPage('orders');
+
+      notify('Commande enregistrée avec succès ! 🎉');
+    } catch (error) {
+      console.error(
+        'Erreur lors de la commande :',
+        error
+      );
+
+      notify(
+        error.message &&
+          error.message.includes('«')
+          ? error.message
+          : 'Impossible de passer la commande pour le moment.'
+      );
+    } finally {
+      setPlacingOrder(false);
+    }
+  };
+
+  const handleUpdateOrderStatus = async (
+    order,
+    newStatus
+  ) => {
+    try {
+      await updateDoc(doc(db, 'orders', order.id), {
+        status: newStatus
+      });
+
+      setSellerOrders((currentOrders) =>
+        currentOrders.map((currentOrder) =>
+          currentOrder.id === order.id
+            ? { ...currentOrder, status: newStatus }
+            : currentOrder
+        )
+      );
+
+      notify('Statut de la commande mis à jour.');
+    } catch (error) {
+      console.error(
+        'Erreur de mise à jour de la commande :',
+        error
+      );
+
+      notify('Impossible de mettre à jour la commande.');
+    }
+  };
+
+  const renderOrderCard = (order, forSeller = false) => {
+    const lines = forSeller
+      ? (order.items || []).filter(
+          (item) => item.sellerId === user?.uid
+        )
+      : order.items || [];
+
+    const linesTotal = lines.reduce(
+      (total, item) =>
+        total +
+        Number(item.price || 0) *
+          Number(item.qty || 1),
+      0
+    );
+
+    const orderDate = order.createdAt
+      ? new Date(order.createdAt).toLocaleString('fr-FR')
+      : '';
+
+    return (
+      <div
+        key={order.id}
+        style={{
+          marginTop: '18px',
+          padding: '20px',
+          background: '#fff',
+          borderRadius: '18px',
+          border: '1px solid #eee',
+          textAlign: 'left',
+          boxShadow: '0 6px 20px rgba(0,0,0,0.05)'
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '8px',
+            marginBottom: '12px'
+          }}
+        >
+          <strong>
+            {orderStatusLabels[order.status] ||
+              order.status}
+          </strong>
+
+          <span style={{ color: '#777', fontSize: '13px' }}>
+            {orderDate}
+          </span>
+        </div>
+
+        {lines.map((item, index) => (
+          <div
+            key={`${order.id}-${index}`}
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: '10px',
+              padding: '6px 0',
+              borderBottom: '1px solid #f3f3f3'
+            }}
+          >
+            <span>
+              {item.name} × {item.qty}
+            </span>
+
+            <span>
+              {(
+                Number(item.price || 0) *
+                Number(item.qty || 1)
+              ).toLocaleString('fr-FR')}{' '}
+              FCFA
+            </span>
+          </div>
+        ))}
+
+        {forSeller ? (
+          <div
+            style={{
+              marginTop: '12px',
+              fontSize: '14px',
+              lineHeight: '1.6',
+              color: '#444'
+            }}
+          >
+            <div>
+              <strong>Client :</strong> {order.buyerName}{' '}
+              — {order.buyerPhone}
+            </div>
+
+            <div>
+              <strong>Livraison :</strong> {order.address},{' '}
+              {order.city}
+            </div>
+
+            <div>
+              <strong>Total de vos articles :</strong>{' '}
+              {linesTotal.toLocaleString('fr-FR')} FCFA
+            </div>
+
+            <div style={{ marginTop: '12px' }}>
+              {order.status === 'nouvelle' && (
+                <button
+                  className="cart-button"
+                  onClick={() =>
+                    handleUpdateOrderStatus(
+                      order,
+                      'en_livraison'
+                    )
+                  }
+                >
+                  🚚 Marquer en livraison
+                </button>
+              )}
+
+              {order.status === 'en_livraison' && (
+                <button
+                  className="cart-button"
+                  onClick={() =>
+                    handleUpdateOrderStatus(
+                      order,
+                      'livree'
+                    )
+                  }
+                >
+                  ✅ Marquer comme livrée
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div
+            style={{
+              marginTop: '12px',
+              fontSize: '14px',
+              lineHeight: '1.6',
+              color: '#444'
+            }}
+          >
+            <div>
+              Livraison : {order.deliveryFee?.toLocaleString('fr-FR')} FCFA
+            </div>
+
+            <div>
+              Paiement :{' '}
+              {paymentLabels[order.paymentMethod] ||
+                order.paymentMethod}{' '}
+              (à régler avec le vendeur)
+            </div>
+
+            <div
+              style={{
+                marginTop: '6px',
+                fontSize: '16px'
+              }}
+            >
+              <strong>
+                Total : {Number(order.total || 0).toLocaleString('fr-FR')} FCFA
+              </strong>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // =====================================================
   // NAVIGATION CLIENT
   // =====================================================
 
@@ -625,7 +1269,7 @@ useEffect(() => {
     setProfileMenuOpen(false);
 
     if (cart.length === 0) {
-      alert('Votre panier est vide.');
+      notify('Votre panier est vide.');
       return;
     }
 
@@ -639,7 +1283,7 @@ useEffect(() => {
       !orderInfo.name ||
       !orderInfo.phone
     ) {
-      alert(
+      notify(
         'Veuillez renseigner votre nom et votre numéro de téléphone.'
       );
       return;
@@ -649,7 +1293,7 @@ useEffect(() => {
       !orderInfo.city ||
       !orderInfo.address
     ) {
-      alert(
+      notify(
         'Veuillez renseigner votre ville et votre adresse de livraison.'
       );
       return;
@@ -659,7 +1303,7 @@ useEffect(() => {
       orderInfo.driverChoice === 'client' &&
       !orderInfo.selectedDriver
     ) {
-      alert(
+      notify(
         'Veuillez choisir un livreur ou sélectionner « Le commerçant choisit ».'
       );
       return;
@@ -2088,7 +2732,7 @@ useEffect(() => {
               <SellerDashboardCard
                 icon="📦"
                 title="Mes produits"
-                description={`Gérez vos articles et votre stock. ${sellerProducts.length} produit(s) actuellement.`}
+                description={`Gérez vos articles et votre stock. ${mySellerProducts.length} produit(s) actuellement.`}
                 onClick={
                   goToSellerProducts
                 }
@@ -2204,7 +2848,7 @@ useEffect(() => {
                       '#111'
                   }}
                 >
-                  {sellerProducts.length}
+                  {mySellerProducts.length}
                 </strong>
               </div>
 
@@ -2472,9 +3116,9 @@ useEffect(() => {
                       0
                   }}
                 >
-                  {sellerProducts.length}{' '}
+                  {mySellerProducts.length}{' '}
                   produit
-                  {sellerProducts.length >
+                  {mySellerProducts.length >
                   1
                     ? 's'
                     : ''}
@@ -2594,7 +3238,7 @@ useEffect(() => {
             </button>
           </div>
 
-          {sellerProducts.length ===
+          {mySellerProducts.length ===
           0 ? (
             <div
               style={{
@@ -2661,7 +3305,7 @@ useEffect(() => {
                   '18px'
               }}
             >
-              {sellerProducts.map(
+              {mySellerProducts.map(
                 (product) => (
                   <div
                     key={
@@ -2761,6 +3405,26 @@ useEffect(() => {
                           product.category
                         }
                       </p>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleDeleteProduct(product)
+                        }
+                        style={{
+                          width: '100%',
+                          marginTop: '15px',
+                          padding: '11px 14px',
+                          border: 'none',
+                          borderRadius: '10px',
+                          background: '#fff1f1',
+                          color: '#d93025',
+                          fontWeight: '700',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        🗑️ Supprimer le produit
+                      </button>
                     </div>
                   </div>
                 )
@@ -2896,7 +3560,9 @@ useEffect(() => {
               </div>
             ) : (
               <div>
-                {/* Les commandes Firebase seront affichées ici plus tard. */}
+                {sellerOrders.map((order) =>
+                  renderOrderCard(order, true)
+                )}
               </div>
             )}
           </div>
@@ -3245,7 +3911,7 @@ useEffect(() => {
                     '30px'
                 }}
               >
-                {sellerProducts.length}
+                {mySellerProducts.length}
               </strong>
             </div>
 
@@ -4148,6 +4814,7 @@ useEffect(() => {
               Retrouvez ici vos commandes passées sur BABI-BABA.
             </p>
 
+            {orders.length === 0 ? (
             <div
               style={{
                 marginTop:
@@ -4216,6 +4883,13 @@ useEffect(() => {
                 🛍️ Commencer mes achats
               </button>
             </div>
+          ) : (
+            <div>
+              {orders.map((order) =>
+                renderOrderCard(order, false)
+              )}
+            </div>
+          )}
           </div>
         </main>
 
@@ -4277,11 +4951,12 @@ useEffect(() => {
               </div>
 
               <div className="delivery-options">
-                <label className="delivery-option selected">
+                <label className={`delivery-option ${paymentMethod === 'orange' ? 'selected' : ''}`}>
                   <input
                     type="radio"
                     name="payment"
-                    defaultChecked
+                    checked={paymentMethod === 'orange'}
+                    onChange={() => setPaymentMethod('orange')}
                   />
 
                   <div className="delivery-option-content">
@@ -4295,10 +4970,12 @@ useEffect(() => {
                   </div>
                 </label>
 
-                <label className="delivery-option">
+                <label className={`delivery-option ${paymentMethod === 'mtn' ? 'selected' : ''}`}>
                   <input
                     type="radio"
                     name="payment"
+                    checked={paymentMethod === 'mtn'}
+                    onChange={() => setPaymentMethod('mtn')}
                   />
 
                   <div className="delivery-option-content">
@@ -4312,10 +4989,12 @@ useEffect(() => {
                   </div>
                 </label>
 
-                <label className="delivery-option">
+                <label className={`delivery-option ${paymentMethod === 'wave' ? 'selected' : ''}`}>
                   <input
                     type="radio"
                     name="payment"
+                    checked={paymentMethod === 'wave'}
+                    onChange={() => setPaymentMethod('wave')}
                   />
 
                   <div className="delivery-option-content">
@@ -4388,18 +5067,27 @@ useEffect(() => {
 
               <button
                 className="checkout-button"
-                onClick={() =>
-                  alert(
-                    'Le système de paiement BABI-BABA sera connecté prochainement 🚀'
-                  )
-                }
+                onClick={handlePlaceOrder}
+                disabled={placingOrder}
               >
-                🔒 Payer{' '}
-                {orderTotal.toLocaleString(
-                  'fr-FR'
-                )}{' '}
-                FCFA
+                {placingOrder
+                  ? 'Enregistrement...'
+                  : `✅ Confirmer la commande · ${orderTotal.toLocaleString(
+                      'fr-FR'
+                    )} FCFA`}
               </button>
+
+              <p
+                style={{
+                  marginTop: '12px',
+                  fontSize: '13px',
+                  color: '#777',
+                  lineHeight: '1.5'
+                }}
+              >
+                Le paiement en ligne n'est pas encore activé : le règlement
+                par Mobile Money se fait directement avec le vendeur.
+              </p>
             </section>
 
             <aside className="order-summary">
@@ -6355,10 +7043,10 @@ useEffect(() => {
                   <p>
                     📦{' '}
                     {
-                      sellerProducts.length
+                      mySellerProducts.length
                     }{' '}
                     produit
-                    {sellerProducts.length >
+                    {mySellerProducts.length >
                     1
                       ? 's'
                       : ''}
